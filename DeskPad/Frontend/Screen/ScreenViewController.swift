@@ -1,11 +1,7 @@
 import Cocoa
-import ReSwift
+import ScreenCaptureKit
 
-enum ScreenViewAction: Action {
-    case setDisplayID(CGDirectDisplayID)
-}
-
-class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDelegate {
+class ScreenViewController: NSViewController, NSWindowDelegate, SCStreamOutput, SCStreamDelegate {
     override func loadView() {
         view = NSView()
         view.wantsLayer = true
@@ -13,7 +9,8 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
     }
 
     private var display: CGVirtualDisplay!
-    private var stream: CGDisplayStream?
+    private var stream: SCStream?
+    private var streamStartTask: Task<Void, Never>?
     private var isWindowHighlighted = false
     private var previousResolution: CGSize?
     private var previousScaleFactor: CGFloat?
@@ -32,8 +29,21 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
         descriptor.serialNum = 0x0001
 
         let display = CGVirtualDisplay(descriptor: descriptor)
-        store.dispatch(ScreenViewAction.setDisplayID(display.displayID))
         self.display = display
+
+        // Registered before apply(), which triggers the notification carrying the initial resolution.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: NSApplication.shared,
+            queue: .main
+        ) { [weak self] _ in
+            self?.screenParametersDidChange()
+        }
+        let mouseTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.updateWindowHighlight()
+        }
+        // Lets the system coalesce this wakeup with others; highlight latency isn't critical.
+        mouseTimer.tolerance = 0.1
 
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = 1
@@ -61,45 +71,121 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
         display.apply(settings)
     }
 
-    override func update(with viewData: ScreenViewData) {
-        if viewData.isWindowHighlighted != isWindowHighlighted {
-            isWindowHighlighted = viewData.isWindowHighlighted
-            view.window?.backgroundColor = isWindowHighlighted
-                ? NSColor(named: "TitleBarActive")
-                : NSColor(named: "TitleBarInactive")
-            if isWindowHighlighted {
-                view.window?.orderFrontRegardless()
+    private func updateWindowHighlight() {
+        let mouseLocation = NSEvent.mouseLocation
+        let screenContainingMouse = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
+        let isWithinScreen = screenContainingMouse?.displayID == display.displayID
+        guard isWithinScreen != isWindowHighlighted else {
+            return
+        }
+        isWindowHighlighted = isWithinScreen
+        view.window?.backgroundColor = isWindowHighlighted
+            ? NSColor(named: "TitleBarActive")
+            : NSColor(named: "TitleBarInactive")
+        if isWindowHighlighted {
+            view.window?.orderFrontRegardless()
+        }
+    }
+
+    private func screenParametersDidChange() {
+        guard let screen = NSScreen.screens.first(where: { $0.displayID == display.displayID }) else {
+            return
+        }
+        let resolution = screen.frame.size
+        let scaleFactor = screen.backingScaleFactor
+        guard resolution != previousResolution || scaleFactor != previousScaleFactor else {
+            return
+        }
+        previousResolution = resolution
+        previousScaleFactor = scaleFactor
+        view.window?.setContentSize(resolution)
+        view.window?.contentAspectRatio = resolution
+        view.window?.center()
+        updateStream(resolution: resolution, scaleFactor: scaleFactor)
+    }
+
+    private func updateStream(resolution: CGSize, scaleFactor: CGFloat) {
+        let configuration = SCStreamConfiguration()
+        configuration.width = Int(resolution.width * scaleFactor)
+        configuration.height = Int(resolution.height * scaleFactor)
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        configuration.showsCursor = true
+
+        if let stream {
+            stream.updateConfiguration(configuration) { error in
+                if let error {
+                    NSLog("DeskPad: failed to update capture configuration: \(error)")
+                }
             }
+            return
         }
 
-        if
-            viewData.resolution != .zero,
-            viewData.resolution != previousResolution
-            || viewData.scaleFactor != previousScaleFactor
-        {
-            previousResolution = viewData.resolution
-            previousScaleFactor = viewData.scaleFactor
-            stream = nil
-            view.window?.setContentSize(viewData.resolution)
-            view.window?.contentAspectRatio = viewData.resolution
-            view.window?.center()
-            let stream = CGDisplayStream(
-                dispatchQueueDisplay: display.displayID,
-                outputWidth: Int(viewData.resolution.width * viewData.scaleFactor),
-                outputHeight: Int(viewData.resolution.height * viewData.scaleFactor),
-                pixelFormat: 1_111_970_369,
-                properties: [
-                    CGDisplayStream.showCursor: true,
-                ] as CFDictionary,
-                queue: .main,
-                handler: { [weak self] _, _, frameSurface, _ in
-                    if let surface = frameSurface {
-                        self?.view.layer?.contents = surface
-                    }
+        streamStartTask?.cancel()
+        streamStartTask = Task { [weak self] in
+            guard let self, let display = await self.findCapturableDisplay() else {
+                return
+            }
+            do {
+                let stream = SCStream(
+                    filter: SCContentFilter(display: display, excludingWindows: []),
+                    configuration: configuration,
+                    delegate: self
+                )
+                try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .main)
+                try await stream.startCapture()
+                if Task.isCancelled {
+                    try? await stream.stopCapture()
+                    return
                 }
-            )
-            self.stream = stream
-            stream?.start()
+                self.stream = stream
+            } catch {
+                NSLog("DeskPad: failed to start screen capture: \(error)")
+            }
+        }
+    }
+
+    // A freshly created virtual display can take a moment to appear in SCShareableContent.
+    private func findCapturableDisplay() async -> SCDisplay? {
+        for _ in 0 ..< 20 {
+            do {
+                let content = try await SCShareableContent.current
+                if let match = content.displays.first(where: { $0.displayID == display.displayID }) {
+                    return match
+                }
+            } catch {
+                NSLog("DeskPad: failed to query shareable content: \(error)")
+                return nil
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+            if Task.isCancelled {
+                return nil
+            }
+        }
+        NSLog("DeskPad: virtual display \(display.displayID) never became capturable")
+        return nil
+    }
+
+    nonisolated func stream(_: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of _: SCStreamOutputType) {
+        // Idle frames (no screen change) carry no image buffer.
+        guard
+            let pixelBuffer = sampleBuffer.imageBuffer,
+            let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue()
+        else {
+            return
+        }
+        MainActor.assumeIsolated {
+            view.layer?.contents = surface
+        }
+    }
+
+    nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
+        NSLog("DeskPad: screen capture stopped: \(error)")
+        let stoppedStreamID = ObjectIdentifier(stream)
+        DispatchQueue.main.async { [weak self] in
+            if let self, let current = self.stream, ObjectIdentifier(current) == stoppedStreamID {
+                self.stream = nil
+            }
         }
     }
 
@@ -124,6 +210,6 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
             x: clickedPoint.x / view.frame.width * screenResolution.width,
             y: (view.frame.height - clickedPoint.y) / view.frame.height * screenResolution.height
         )
-        store.dispatch(MouseLocationAction.requestMove(toPoint: onScreenPoint))
+        CGDisplayMoveCursorToPoint(display.displayID, onScreenPoint)
     }
 }
