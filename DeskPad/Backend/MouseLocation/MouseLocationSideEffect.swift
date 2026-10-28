@@ -16,8 +16,13 @@ func mouseLocationSideEffect() -> SideEffect {
                 let screens = NSScreen.screens
                 let screenContainingMouse = (screens.first { NSMouseInRect(mouseLocation, $0.frame, false) })
                 let isWithinScreen = screenContainingMouse?.displayID == getState()?.screenConfigurationState.displayID
+                guard isWithinScreen != getState()?.mouseLocationState.isWithinScreen else {
+                    return
+                }
                 dispatch(MouseLocationAction.located(isWithinScreen: isWithinScreen))
             }
+            // Lets the system coalesce this wakeup with others; highlight latency isn't critical.
+            timer?.tolerance = 0.1
         }
         switch action {
         case let MouseLocationAction.requestMove(point):
