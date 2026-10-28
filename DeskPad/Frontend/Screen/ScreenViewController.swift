@@ -79,6 +79,7 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
         {
             previousResolution = viewData.resolution
             previousScaleFactor = viewData.scaleFactor
+            stream?.stop()
             stream = nil
             view.window?.setContentSize(viewData.resolution)
             view.window?.contentAspectRatio = viewData.resolution
