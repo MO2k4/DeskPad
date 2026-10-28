@@ -3,7 +3,7 @@ import ReSwift
 
 let store = Store<AppState>(
     reducer: appReducer,
-    state: AppState.initialState,
+    state: AppState(),
     middleware: [
         sideEffectsMiddleware,
     ]
