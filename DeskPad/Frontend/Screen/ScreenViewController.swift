@@ -1,12 +1,7 @@
 import Cocoa
-import ReSwift
 import ScreenCaptureKit
 
-enum ScreenViewAction: Action {
-    case setDisplayID(CGDirectDisplayID)
-}
-
-class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDelegate, SCStreamOutput, SCStreamDelegate {
+class ScreenViewController: NSViewController, NSWindowDelegate, SCStreamOutput, SCStreamDelegate {
     override func loadView() {
         view = NSView()
         view.wantsLayer = true
@@ -34,8 +29,21 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
         descriptor.serialNum = 0x0001
 
         let display = CGVirtualDisplay(descriptor: descriptor)
-        store.dispatch(ScreenViewAction.setDisplayID(display.displayID))
         self.display = display
+
+        // Registered before apply(), which triggers the notification carrying the initial resolution.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: NSApplication.shared,
+            queue: .main
+        ) { [weak self] _ in
+            self?.screenParametersDidChange()
+        }
+        let mouseTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.updateWindowHighlight()
+        }
+        // Lets the system coalesce this wakeup with others; highlight latency isn't critical.
+        mouseTimer.tolerance = 0.1
 
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = 1
@@ -63,29 +71,37 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
         display.apply(settings)
     }
 
-    override func update(with viewData: ScreenViewData) {
-        if viewData.isWindowHighlighted != isWindowHighlighted {
-            isWindowHighlighted = viewData.isWindowHighlighted
-            view.window?.backgroundColor = isWindowHighlighted
-                ? NSColor(named: "TitleBarActive")
-                : NSColor(named: "TitleBarInactive")
-            if isWindowHighlighted {
-                view.window?.orderFrontRegardless()
-            }
+    private func updateWindowHighlight() {
+        let mouseLocation = NSEvent.mouseLocation
+        let screenContainingMouse = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
+        let isWithinScreen = screenContainingMouse?.displayID == display.displayID
+        guard isWithinScreen != isWindowHighlighted else {
+            return
         }
+        isWindowHighlighted = isWithinScreen
+        view.window?.backgroundColor = isWindowHighlighted
+            ? NSColor(named: "TitleBarActive")
+            : NSColor(named: "TitleBarInactive")
+        if isWindowHighlighted {
+            view.window?.orderFrontRegardless()
+        }
+    }
 
-        if
-            viewData.resolution != .zero,
-            viewData.resolution != previousResolution
-            || viewData.scaleFactor != previousScaleFactor
-        {
-            previousResolution = viewData.resolution
-            previousScaleFactor = viewData.scaleFactor
-            view.window?.setContentSize(viewData.resolution)
-            view.window?.contentAspectRatio = viewData.resolution
-            view.window?.center()
-            updateStream(resolution: viewData.resolution, scaleFactor: viewData.scaleFactor)
+    private func screenParametersDidChange() {
+        guard let screen = NSScreen.screens.first(where: { $0.displayID == display.displayID }) else {
+            return
         }
+        let resolution = screen.frame.size
+        let scaleFactor = screen.backingScaleFactor
+        guard resolution != previousResolution || scaleFactor != previousScaleFactor else {
+            return
+        }
+        previousResolution = resolution
+        previousScaleFactor = scaleFactor
+        view.window?.setContentSize(resolution)
+        view.window?.contentAspectRatio = resolution
+        view.window?.center()
+        updateStream(resolution: resolution, scaleFactor: scaleFactor)
     }
 
     private func updateStream(resolution: CGSize, scaleFactor: CGFloat) {
@@ -194,6 +210,6 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
             x: clickedPoint.x / view.frame.width * screenResolution.width,
             y: (view.frame.height - clickedPoint.y) / view.frame.height * screenResolution.height
         )
-        store.dispatch(MouseLocationAction.requestMove(toPoint: onScreenPoint))
+        CGDisplayMoveCursorToPoint(display.displayID, onScreenPoint)
     }
 }
