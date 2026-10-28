@@ -79,6 +79,7 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
         {
             previousResolution = viewData.resolution
             previousScaleFactor = viewData.scaleFactor
+            // Releasing without stopping leaves the old stream capturing in the background.
             stream?.stop()
             stream = nil
             view.window?.setContentSize(viewData.resolution)
